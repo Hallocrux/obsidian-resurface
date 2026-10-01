@@ -1,7 +1,8 @@
 /**
  * SettingsTab
  *
- * 基础层 4 项 + 高级层（折叠）。MVP 只暴露基础项；高级项可见但部分功能在 M1+ 才真正生效。
+ * 基础设置 + rediscovery/FSRS 调度设置。所有调度数据仍保存在插件
+ * data.json，Markdown 只保存 resurface-id。
  */
 
 import { App, PluginSettingTab, Setting } from "obsidian";
@@ -26,23 +27,8 @@ export class ResurfaceSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "基础" });
 
     new Setting(containerEl)
-      .setName("每日复习上限")
-      .setDesc("每天最多展示多少条待复习笔记")
-      .addSlider((slider) =>
-        slider
-          .setLimits(5, 50, 1)
-          .setValue(settings.dailyLimit)
-          .setDynamicTooltip()
-          .onChange(async (v) => {
-            settings.dailyLimit = v;
-            await this.plugin.storage.save();
-            this.plugin.refreshBadge();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("首次复习间隔")
-      .setDesc("新笔记写完多少天后开始第一次复习")
+      .setName("首次出现间隔")
+      .setDesc("新笔记写完多少天后第一次回到复活池")
       .addSlider((slider) =>
         slider
           .setLimits(1, 14, 1)
@@ -50,6 +36,20 @@ export class ResurfaceSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             settings.firstReviewDays = v;
+            await this.plugin.storage.save();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Soon 间隔")
+      .setDesc("选择 Soon 后，多少天后再次看到这条笔记")
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 30, 1)
+          .setValue(settings.rediscoverySoonDays)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            settings.rediscoverySoonDays = v;
             await this.plugin.storage.save();
           }),
       );
@@ -116,6 +116,25 @@ export class ResurfaceSettingTab extends PluginSettingTab {
       );
 
     new Setting(advDetails)
+      .setName("Later 间隔阶梯")
+      .setDesc("以天为单位，用逗号分隔；默认 30, 90, 180, 365")
+      .addText((text) =>
+        text
+          .setValue(settings.rediscoveryLaterIntervals.join(", "))
+          .onChange(async (value) => {
+            const intervals = value
+              .split(",")
+              .map((part) => part.trim())
+              .filter((part) => /^\d+$/.test(part))
+              .map((part) => Number(part))
+              .filter((part) => Number.isInteger(part) && part > 0);
+            if (intervals.length === 0) return;
+            settings.rediscoveryLaterIntervals = intervals;
+            await this.plugin.storage.save();
+          }),
+      );
+
+    new Setting(advDetails)
       .setName("TLDR 字段名")
       .setDesc("读取 frontmatter 里的哪个字段作为摘要")
       .addText((t) =>
@@ -168,58 +187,9 @@ export class ResurfaceSettingTab extends PluginSettingTab {
           }),
       );
 
-    // M1 相关字段（UI 暴露但实际逻辑待实现）
-    advDetails.createEl("h4", { text: "笔记编辑影响调度 (M1)" });
-
-    new Setting(advDetails)
-      .setName("编辑阈值 · 绝对字数")
-      .setDesc("编辑影响调度的字数阈值")
-      .addSlider((slider) =>
-        slider
-          .setLimits(20, 500, 10)
-          .setValue(settings.editThresholdAbsolute)
-          .setDynamicTooltip()
-          .onChange(async (v) => {
-            settings.editThresholdAbsolute = v;
-            await this.plugin.storage.save();
-          }),
-      );
-
-    new Setting(advDetails)
-      .setName("编辑阈值 · 相对比例")
-      .setDesc("编辑影响调度的比例阈值（百分比）")
-      .addSlider((slider) =>
-        slider
-          .setLimits(5, 50, 1)
-          .setValue(Math.round(settings.editThresholdRatio * 100))
-          .setDynamicTooltip()
-          .onChange(async (v) => {
-            settings.editThresholdRatio = v / 100;
-            await this.plugin.storage.save();
-          }),
-      );
-
-    new Setting(advDetails)
-      .setName("超阈值时的动作")
-      .setDesc("大改笔记后对 Stability 的调整")
-      .addDropdown((dd) =>
-        dd
-          .addOption("x0.3", "降低到 30%（激进）")
-          .addOption("x0.5", "降低到 50%（默认）")
-          .addOption("x0.7", "降低到 70%（温和）")
-          .addOption("reset", "重置为新笔记")
-          .addOption("none", "不响应")
-          .setValue(settings.editTriggerAction)
-          .onChange(async (v) => {
-            settings.editTriggerAction =
-              v as typeof settings.editTriggerAction;
-            await this.plugin.storage.save();
-          }),
-      );
-
-    // 占位：排除列表管理 / FSRS 参数优化（M2 / M3）
+    // 编辑正文不会在 v0.1 改变调度；调度元数据只保存在 data.json。
     advDetails.createEl("p", {
-      text: "排除列表管理、FSRS 参数重新优化将在后续版本提供。",
+      text: "笔记编辑不会在当前版本改变复习时间。排除列表管理和 FSRS 参数优化将在后续版本提供。",
       cls: "setting-item-description",
     });
   }

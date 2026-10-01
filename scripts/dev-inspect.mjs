@@ -1,6 +1,6 @@
 /**
  * 开发辅助：查看复习状态
- * 打印每条笔记的 FSRS 状态（S/D/next_review）
+ * 打印每条笔记的 rediscovery / FSRS 状态
  *
  * 用法：node scripts/dev-inspect.mjs [筛选 keyword]
  */
@@ -23,24 +23,28 @@ const keyword = process.argv[2] ?? "";
 const raw = await readFile(DATA_FILE, "utf-8");
 const data = JSON.parse(raw);
 
-const STATE_NAMES = { 0: "New", 1: "Learning", 2: "Review", 3: "Relearning" };
-
 // 总览
 const now = new Date();
 let total = 0;
-let excluded = 0;
+let suspended = 0;
 let reviewed = 0;
 let due = 0;
-for (const [path, n] of Object.entries(data.notes)) {
+for (const [, n] of Object.entries(data.notes)) {
   total++;
-  if (n.excluded) excluded++;
-  if (n.reps > 0) reviewed++;
-  if (!n.excluded && new Date(n.nextReview) <= now) due++;
+  if (n.mode === "suspended") suspended++;
+  if ((n.fsrs?.reps ?? 0) > 0) reviewed++;
+  if (
+    n.mode !== "suspended" &&
+    n.nextReview &&
+    new Date(n.nextReview) <= now
+  ) {
+    due++;
+  }
 }
 
 console.log(`\n📊 复活池概览`);
 console.log(`  总计:       ${total}`);
-console.log(`  已排除:     ${excluded}`);
+console.log(`  suspended:  ${suspended}`);
 console.log(`  有过复习:   ${reviewed}`);
 console.log(`  当前到期:   ${due}`);
 console.log(`  累计复习:   ${data.stats.totalReviews} 次`);
@@ -50,11 +54,20 @@ console.log(`  连续天数:   ${data.stats.streakDays}`);
 console.log(`\n📝 笔记状态${keyword ? `（筛选 "${keyword}"）` : "（仅显示已复习过的）"}\n`);
 
 const filtered = Object.entries(data.notes)
-  .filter(([path, n]) => {
-    if (keyword) return path.includes(keyword);
-    return n.reps > 0 || !n.excluded && new Date(n.nextReview) <= now;
+  .filter(([, n]) => {
+    if (keyword) return n.path.includes(keyword);
+    return (
+      (n.fsrs?.reps ?? 0) > 0 ||
+      (n.mode !== "suspended" &&
+        n.nextReview &&
+        new Date(n.nextReview) <= now)
+    );
   })
-  .sort(([, a], [, b]) => new Date(a.nextReview) - new Date(b.nextReview));
+  .sort(([, a], [, b]) => {
+    const aTime = a.nextReview ? new Date(a.nextReview).getTime() : Infinity;
+    const bTime = b.nextReview ? new Date(b.nextReview).getTime() : Infinity;
+    return aTime - bTime;
+  });
 
 if (filtered.length === 0) {
   console.log("  （无匹配）");
@@ -63,33 +76,41 @@ if (filtered.length === 0) {
   console.log(
     "  " +
       "path".padEnd(PAD) +
-      "  state     reps  S       next_review         excl",
+      "  mode          reps  S       next_review         susp",
   );
   console.log("  " + "─".repeat(PAD + 45));
-  for (const [path, n] of filtered) {
+  for (const [, n] of filtered) {
+    const path = n.path;
     const shortPath = path.length > PAD - 1
       ? "…" + path.slice(-(PAD - 2))
       : path.padEnd(PAD);
-    const next = new Date(n.nextReview);
-    const nextStr = next.toISOString().replace("T", " ").slice(0, 16);
-    const daysFromNow = Math.round(
-      (next - now) / (24 * 3600 * 1000),
-    );
+    const next = n.nextReview ? new Date(n.nextReview) : null;
+    const nextStr = next
+      ? next.toISOString().replace("T", " ").slice(0, 16)
+      : "-";
+    const daysFromNow = next
+      ? Math.round((next.getTime() - now.getTime()) / (24 * 3600 * 1000))
+      : null;
     const nextLabel =
-      daysFromNow <= 0 ? `${nextStr} ⚡已到期` : `${nextStr} (+${daysFromNow}d)`;
+      daysFromNow === null
+        ? nextStr
+        : daysFromNow <= 0
+          ? `${nextStr} ⚡已到期`
+          : `${nextStr} (+${daysFromNow}d)`;
+    const card = n.fsrs ?? {};
     console.log(
       "  " +
         shortPath.padEnd(PAD) +
         "  " +
-        (STATE_NAMES[n.state] ?? n.state).padEnd(9) +
+        String(n.mode).padEnd(13) +
         " " +
-        String(n.reps).padEnd(5) +
+        String(card.reps ?? 0).padEnd(5) +
         " " +
-        n.stability.toFixed(2).padEnd(7) +
+        Number(card.stability ?? 0).toFixed(2).padEnd(7) +
         " " +
         nextLabel +
         " " +
-        (n.excluded ? "✗" : ""),
+        (n.mode === "suspended" ? "✗" : ""),
     );
   }
 }

@@ -4,6 +4,23 @@ Resurface 版本变更记录。遵循 [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+### Added · 新增
+
+- **两阶段复习模型**：笔记先进入 incubating/rediscovery，由 Never、Later、Soon、Learn 分流；只有 Learn 后才使用 FSRS。
+- **稳定笔记身份**：Markdown 缺少 `resurface-id` 时自动写入 UUID，状态存储改为按 NoteId 索引，支持 Codex/Obsidian 移动与重写。
+- **Later 间隔阶梯**：默认 30 / 90 / 180 / 365 天，可在设置中配置。
+- **快进一天命令**：通过命令面板把未来复习时间提前一天，不修改已经到期的笔记。
+
+### Changed · 变更
+
+- schema 从 v1 升级到 v2，兼容迁移旧的路径索引、excluded 状态和 revlog。
+- 移除每日复习上限；到期笔记按 due 时间全部进入队列。
+- `data.json` 仍保存调度元数据，Markdown 只增加 `resurface-id`，不会写入 FSRS 字段。
+
+### Tests · 测试
+
+- 新增 ReviewService、NoteId、路径迁移、ID 冲突、schema migration 和快进命令测试；总计 60 个测试。
+
 ### Fixed · 修复
 
 - **跨日/聚焦时侧栏不刷新**：之前只有在用户主动点 ribbon、切到/打开侧栏 view、评分后推进、或笔记文件变化时才会触发 `advance()` / `refresh()`。如果用户昨天没关 Obsidian，今天切回窗口时看到的仍是昨日冻结的画面（队列、进度、badge 都不更新）。现在监听 `workspace.active-leaf-change` / `window.focus` / `document.visibilitychange` 三个事件，共用 250ms 防抖，聚焦时自动 `session.refresh()` + 刷新 badge + 刷新侧栏（rating/waitNext 态仍受守卫保护，不会打断评分流程）。

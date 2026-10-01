@@ -4,9 +4,10 @@
  * 生命周期与服务装配。
  */
 
-import { Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { MarkdownView, Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { StorageService } from "./src/domain/StorageService";
 import { FSRSService } from "./src/domain/FSRSService";
+import { ReviewService } from "./src/domain/ReviewService";
 import { Scheduler } from "./src/domain/Scheduler";
 import { ReviewSession } from "./src/domain/ReviewSession";
 import { VaultWatcher } from "./src/obsidian/VaultWatcher";
@@ -23,6 +24,7 @@ import type { NotePath } from "./src/domain/types";
 export default class ResurfacePlugin extends Plugin {
   storage!: StorageService;
   fsrs!: FSRSService;
+  review!: ReviewService;
   scheduler!: Scheduler;
   session!: ReviewSession;
 
@@ -37,7 +39,11 @@ export default class ResurfacePlugin extends Plugin {
     await this.storage.load();
 
     this.fsrs = new FSRSService(this.storage);
-    this.scheduler = new Scheduler(this.storage, this.fsrs);
+    this.review = new ReviewService(
+      () => this.storage.data.settings,
+      this.fsrs,
+    );
+    this.scheduler = new Scheduler(this.storage);
     this.session = new ReviewSession(
       () => this.storage.data.settings.dayBoundaryHour,
     );
@@ -46,7 +52,7 @@ export default class ResurfacePlugin extends Plugin {
     this.vaultWatcher = new VaultWatcher(
       this,
       this.storage,
-      this.fsrs,
+      this.review,
       () => this.onListMayChange(),
     );
     this.vaultWatcher.register();
@@ -66,14 +72,23 @@ export default class ResurfacePlugin extends Plugin {
     // 5. Settings tab
     this.addSettingTab(new ResurfaceSettingTab(this.app, this));
 
-    // 6. 跨日/聚焦时自动刷新：
+    // 6. 快速体验：把所有未来的复习时间提前一天；已经到期的笔记不动。
+    this.addCommand({
+      id: "advance-future-reviews-one-day",
+      name: "快进一天",
+      callback: () => {
+        void this.advanceFutureReviewsByOneDay();
+      },
+    });
+
+    // 7. 跨日/聚焦时自动刷新：
     //    - active-leaf-change: 用户切换到侧栏 tab / 侧栏重新激活
     //    - window focus: Obsidian 窗口从后台切回前台（跨日常见场景：昨天没关，今天切回）
     //    - visibilitychange: 页面从不可见变可见（electron/tab 场景互补）
     //    所有事件共用防抖，避免短时间内重复计算。
     this.registerAutoRefresh();
 
-    // 7. 首次加载：等 workspace 准备好后再扫描 vault
+    // 8. 首次加载：等 workspace 准备好后再扫描 vault
     this.app.workspace.onLayoutReady(async () => {
       await this.vaultWatcher.backfillExistingNotes();
       this.refreshBadge();
@@ -172,6 +187,20 @@ export default class ResurfacePlugin extends Plugin {
     this.ribbonBadge.setCount(count);
   }
 
+  private async advanceFutureReviewsByOneDay(): Promise<void> {
+    const changed = this.storage.advanceFutureReviewsByOneDay();
+    if (changed === 0) {
+      new Notice("没有需要快进的未来笔记");
+      return;
+    }
+
+    await this.storage.save();
+    this.session.refresh();
+    this.refreshBadge();
+    await this.refreshSideBar();
+    new Notice(`已将 ${changed} 条未来笔记提前一天`);
+  }
+
   // ─── 复习专用 Tab ──────────────────────────
 
   /**
@@ -203,6 +232,14 @@ export default class ResurfacePlugin extends Plugin {
 
     await this.reviewTabLeaf.openFile(file);
     workspace.revealLeaf(this.reviewTabLeaf);
+  }
+
+  /** Whether the active leaf is the review tab showing the current note. */
+  isReviewTabActive(path: NotePath): boolean {
+    if (!this.reviewTabLeaf) return false;
+    if (this.app.workspace.activeLeaf !== this.reviewTabLeaf) return false;
+    const view = this.reviewTabLeaf.view;
+    return view instanceof MarkdownView && view.file?.path === path;
   }
 
   // ─── 统计 ──────────────────────────

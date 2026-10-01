@@ -1,16 +1,19 @@
 /**
  * SideBarView
  *
- * 复习面板。挂在右侧栏。
- * 5 态状态机：initial / cue / rating / waitNext / completed
- *
- * 具体渲染靠原生 DOM。
+ * The view only chooses presentation and forwards actions to ReviewService.
+ * A candidate is tracked by NoteId so a Codex/Obsidian move during review does
+ * not make the current item point at the wrong file.
  */
 
 import { ItemView, TFile, WorkspaceLeaf, Notice } from "obsidian";
 import type ResurfacePlugin from "../../main";
 import { CueExtractor, type Cue } from "../domain/CueExtractor";
-import type { NotePath, Rating } from "../domain/types";
+import type {
+  NoteId,
+  NotePath,
+  ReviewAction,
+} from "../domain/types";
 
 export const VIEW_TYPE_RESURFACE_SIDEBAR = "resurface-sidebar";
 
@@ -18,10 +21,29 @@ type ViewState = "initial" | "cue" | "rating" | "waitNext" | "completed";
 
 export class SideBarView extends ItemView {
   private state: ViewState = "initial";
+  private currentId: NoteId | null = null;
   private currentPath: NotePath | null = null;
   private currentCue: Cue | null = null;
+  private readonly keydownHandler = (event: KeyboardEvent) => {
+    const note = this.currentNote();
+    if (!note) return;
+    const sidebarActive = this.app.workspace.activeLeaf === this.leaf;
+    const reviewTabActive = this.plugin.isReviewTabActive(note.path);
+    if (!sidebarActive && !reviewTabActive) return;
 
-  constructor(leaf: WorkspaceLeaf, private plugin: ResurfacePlugin) {
+    const target = event.target as HTMLElement | null;
+    if (
+      target?.isContentEditable ||
+      target?.tagName === "INPUT" ||
+      target?.tagName === "TEXTAREA" ||
+      target?.tagName === "SELECT"
+    ) {
+      return;
+    }
+    void this.handleShortcut(event);
+  };
+
+  constructor(leaf: WorkspaceLeaf, private readonly plugin: ResurfacePlugin) {
     super(leaf);
   }
 
@@ -38,21 +60,24 @@ export class SideBarView extends ItemView {
   }
 
   async onOpen() {
+    // The active leaf check keeps shortcuts scoped to the review pane while
+    // still working when focus is on one of its buttons.
+    this.registerDomEvent(document, "keydown", this.keydownHandler);
     await this.advance();
   }
 
-  async onClose() {
-    // 无需清理
-  }
+  async onClose() {}
 
-  /** 外部调用：刷新当前状态（例如笔记列表变化后） */
   async refresh() {
-    if (this.state === "cue" || this.state === "initial" || this.state === "completed") {
+    if (
+      this.state === "cue" ||
+      this.state === "initial" ||
+      this.state === "completed"
+    ) {
       await this.advance();
     }
   }
 
-  /** 走向下一个状态：从当前状态推进到合适的显示 */
   async advance() {
     this.plugin.session.refresh();
     const queue = this.plugin.scheduler.getTodayQueue(
@@ -60,13 +85,14 @@ export class SideBarView extends ItemView {
     );
 
     if (queue.length === 0) {
-      // 检查是否是"今日已完成"还是"根本没有待复习"
       const reviewedToday = this.plugin.session.reviewedCount();
       this.state = reviewedToday > 0 ? "completed" : "initial";
+      this.currentId = null;
       this.currentPath = null;
       this.currentCue = null;
     } else {
       const next = queue[0];
+      this.currentId = next.id;
       this.currentPath = next.path;
       this.currentCue = await this.loadCue(next.path);
       this.state = "cue";
@@ -84,49 +110,81 @@ export class SideBarView extends ItemView {
     return CueExtractor.extract(path, content, this.plugin.storage.data.settings);
   }
 
-  // ─── 用户操作 ──────────────────────────
+  private currentNote() {
+    const byId = this.currentId
+      ? this.plugin.storage.getNoteById(this.currentId)
+      : undefined;
+    if (byId) return byId;
+
+    // A Codex rewrite can temporarily replace the ID while restoring deleted
+    // frontmatter. Recover the same path-backed state for the in-progress UI.
+    const recovered = this.currentPath
+      ? this.plugin.storage.getNoteByPath(this.currentPath)
+      : undefined;
+    if (recovered) this.currentId = recovered.id;
+    return recovered;
+  }
 
   private async expandContent() {
-    if (!this.currentPath) return;
-    await this.plugin.openReviewTab(this.currentPath);
+    const note = this.currentNote();
+    if (!note) return;
+    await this.plugin.openReviewTab(note.path);
     this.state = "rating";
     this.render();
   }
 
-  private async submitRating(rating: Rating) {
-    if (!this.currentPath) return;
-    const note = this.plugin.storage.data.notes[this.currentPath];
-    if (!note) return;
+  private async submitAction(action: ReviewAction) {
+    const note = this.currentNote();
+    const id = note?.id;
+    if (!id || !note) return;
 
-    const { newState, logEntry } = this.plugin.fsrs.review(note, rating);
-    Object.assign(note, newState);
-    this.plugin.storage.appendRevlog({
-      ...logEntry,
-      path: this.currentPath,
-    });
-    this.plugin.storage.data.stats.totalReviews++;
-    this.plugin.updateStreakIfNeeded();
-    await this.plugin.storage.save();
+    try {
+      const { newState, logEntry } = this.plugin.review.applyAction(note, action);
+      this.plugin.storage.upsertNote(newState);
+      if (logEntry) {
+        this.plugin.storage.appendRevlog({
+          ...logEntry,
+          noteId: id,
+          path: note.path,
+        });
+      }
+      this.plugin.storage.data.stats.totalReviews++;
+      this.plugin.updateStreakIfNeeded();
+      this.plugin.session.markCompleted(id);
+      await this.plugin.storage.save();
 
-    this.plugin.session.markReviewed(this.currentPath);
-
-    if (this.plugin.storage.data.settings.autoAdvance) {
-      await this.advance();
-    } else {
-      this.state = "waitNext";
-      this.render();
+      if (this.plugin.storage.data.settings.autoAdvance) {
+        await this.advance();
+      } else {
+        this.state = "waitNext";
+        this.render();
+      }
+      this.plugin.refreshBadge();
+    } catch (error) {
+      console.error("[Resurface] review action failed", error);
+      new Notice("无法记录这次复习操作");
     }
-    this.plugin.refreshBadge();
   }
 
-  private async excludeCurrent() {
-    if (!this.currentPath) return;
-    this.plugin.storage.excludeNote(this.currentPath);
-    this.plugin.session.markExcluded(this.currentPath);
-    await this.plugin.storage.save();
-    new Notice("这条笔记已从复习池移除");
-    await this.advance();
-    this.plugin.refreshBadge();
+  private async handleShortcut(event: KeyboardEvent): Promise<void> {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const digit = Number(event.key);
+    if (![1, 2, 3, 4].includes(digit)) return;
+
+    const note = this.currentNote();
+    if (!note) return;
+
+    let action: ReviewAction;
+    if (note.mode === "learning") {
+      if (this.state !== "rating") return;
+      action = (["again", "hard", "good", "easy"] as const)[digit - 1];
+    } else if (this.state === "cue" || this.state === "rating") {
+      action = (["never", "later", "soon", "learn"] as const)[digit - 1];
+    } else {
+      return;
+    }
+    event.preventDefault();
+    await this.submitAction(action);
   }
 
   // ─── 渲染 ──────────────────────────
@@ -159,8 +217,10 @@ export class SideBarView extends ItemView {
     const box = container.createDiv({ cls: "resurface-empty" });
     box.createDiv({ text: "🌱", cls: "emoji" });
 
-    const hasAnyNote = Object.keys(this.plugin.storage.data.notes).length > 0;
-    if (!hasAnyNote) {
+    const activeNotes = Object.values(this.plugin.storage.data.notes).filter(
+      (note) => note.mode !== "suspended",
+    );
+    if (activeNotes.length === 0) {
       box.createEl("p", { text: "还没有笔记进入复活池" });
       box.createEl("p", {
         text: "等你写下第一条笔记 3 天后，它就会来这里重新找你",
@@ -179,7 +239,6 @@ export class SideBarView extends ItemView {
 
   private renderCue(container: HTMLElement) {
     if (!this.currentCue) return;
-
     this.appendProgress(container);
 
     const box = container.createDiv({ cls: "resurface-cue" });
@@ -192,70 +251,80 @@ export class SideBarView extends ItemView {
     });
     expandBtn.onclick = () => void this.expandContent();
 
-    const excludeBtn = box.createEl("button", {
-      text: "不再复习",
-      cls: "resurface-secondary-btn",
-    });
-    excludeBtn.onclick = () => void this.excludeCurrent();
+    const note = this.currentNote();
+    if (note?.mode === "learning") {
+      this.renderNeverButton(box);
+    } else {
+      this.renderTriageActions(box);
+    }
   }
 
   private renderRating(container: HTMLElement) {
     if (!this.currentCue) return;
-
     this.appendProgress(container);
 
     const box = container.createDiv({ cls: "resurface-cue" });
     box.createEl("h3", { text: this.currentCue.title });
-    // 评分阶段仍展示 tldr，和 cue 态保持一致
     box.createEl("blockquote", { text: this.currentCue.tldr });
 
+    const note = this.currentNote();
+    if (note?.mode === "learning") {
+      this.renderLearningActions(box);
+    } else {
+      this.renderTriageActions(box);
+    }
+  }
+
+  private renderTriageActions(container: HTMLElement) {
+    const row = container.createDiv({ cls: "resurface-rating-row" });
+    this.addActionButton(row, "Later", "resurface-rating-btn", "later");
+    this.addActionButton(row, "Soon", "resurface-rating-btn", "soon");
+    this.addActionButton(row, "Learn", "resurface-rating-btn good", "learn");
+    this.renderNeverButton(container);
+  }
+
+  private renderLearningActions(container: HTMLElement) {
     const mode = this.plugin.storage.data.settings.ratingMode;
-    const row = box.createDiv({ cls: "resurface-rating-row" });
+    const row = container.createDiv({ cls: "resurface-rating-row" });
 
     if (mode === "2-button") {
-      const again = row.createEl("button", {
-        text: "不会",
-        cls: "resurface-rating-btn again",
-      });
-      again.onclick = () => void this.submitRating(1);
-      const good = row.createEl("button", {
-        text: "会",
-        cls: "resurface-rating-btn good",
-      });
-      good.onclick = () => void this.submitRating(3);
+      this.addActionButton(
+        row,
+        "不会",
+        "resurface-rating-btn again",
+        "again",
+      );
+      this.addActionButton(row, "会", "resurface-rating-btn good", "good");
     } else {
-      const again = row.createEl("button", {
-        text: "Again",
-        cls: "resurface-rating-btn again",
-      });
-      again.onclick = () => void this.submitRating(1);
-      const hard = row.createEl("button", {
-        text: "Hard",
-        cls: "resurface-rating-btn",
-      });
-      hard.onclick = () => void this.submitRating(2);
-      const good = row.createEl("button", {
-        text: "Good",
-        cls: "resurface-rating-btn good",
-      });
-      good.onclick = () => void this.submitRating(3);
-      const easy = row.createEl("button", {
-        text: "Easy",
-        cls: "resurface-rating-btn",
-      });
-      easy.onclick = () => void this.submitRating(4);
+      this.addActionButton(row, "Again", "resurface-rating-btn again", "again");
+      this.addActionButton(row, "Hard", "resurface-rating-btn", "hard");
+      this.addActionButton(row, "Good", "resurface-rating-btn good", "good");
+      this.addActionButton(row, "Easy", "resurface-rating-btn", "easy");
     }
+    this.renderNeverButton(container);
+  }
 
-    const excludeBtn = box.createEl("button", {
-      text: "不再复习",
-      cls: "resurface-secondary-btn",
-    });
-    excludeBtn.onclick = () => void this.excludeCurrent();
+  private renderNeverButton(container: HTMLElement) {
+    this.addActionButton(
+      container,
+      "Never",
+      "resurface-secondary-btn",
+      "never",
+    );
+  }
+
+  private addActionButton(
+    container: HTMLElement,
+    text: string,
+    cls: string,
+    action: ReviewAction,
+  ) {
+    const button = container.createEl("button", { text, cls });
+    button.onclick = () => void this.submitAction(action);
   }
 
   private renderWaitNext(container: HTMLElement) {
     if (!this.currentCue) return;
-
     this.appendProgress(container);
 
     const box = container.createDiv({ cls: "resurface-cue" });
@@ -300,7 +369,7 @@ export class SideBarView extends ItemView {
     const settings = this.plugin.storage.data.settings;
     const stats = this.plugin.storage.data.stats;
     const poolSize = Object.values(this.plugin.storage.data.notes).filter(
-      (n) => !n.excluded,
+      (note) => note.mode !== "suspended",
     ).length;
 
     const statsBox = container.createDiv({ cls: "resurface-stats" });

@@ -8,11 +8,11 @@
  * 同时提供进度信息（已复习 N / 总 M）给 UI。
  */
 
-import type { NotePath } from "./types";
+import type { NoteId } from "./types";
 import { formatDateKey } from "../utils/date";
 
 export class ReviewSession {
-  private reviewed: Set<NotePath> = new Set();
+  private reviewed: Set<NoteId> = new Set();
   private dateKey: string;
 
   constructor(
@@ -31,16 +31,11 @@ export class ReviewSession {
     }
   }
 
-  markReviewed(path: NotePath): void {
-    this.reviewed.add(path);
+  markCompleted(id: NoteId): void {
+    this.reviewed.add(id);
   }
 
-  markExcluded(path: NotePath): void {
-    // 排除等价于"从今天队列中永久消失"，记到 reviewed 避免再出现
-    this.reviewed.add(path);
-  }
-
-  getReviewedSet(): Set<NotePath> {
+  getReviewedSet(): Set<NoteId> {
     return this.reviewed;
   }
 

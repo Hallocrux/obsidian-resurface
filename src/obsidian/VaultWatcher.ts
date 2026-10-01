@@ -1,26 +1,31 @@
 /**
  * VaultWatcher
  *
- * 监听 Obsidian Vault 的 create / modify / rename / delete 事件。
- * 仅处理 markdown 文件。
- *
- * MVP 职责：
- *   - create: 为新笔记初始化 NoteState
- *   - rename: 迁移 storage 中的 key
- *   - delete: 归档
- *   - modify: MVP 阶段仅更新 mtime（为 M1 的 EditTracker 做数据准备）
+ * Bridges Obsidian file events to the domain identity model. The file's
+ * resurface-id travels with its frontmatter, so path changes do not reset
+ * review state.
  */
 
-import { TFile, type Plugin, type Vault } from "obsidian";
-import type { FSRSService } from "../domain/FSRSService";
+import { TFile, type Plugin } from "obsidian";
+import type { ReviewService } from "../domain/ReviewService";
+import {
+  createNoteId,
+  isValidNoteId,
+  legacyNoteId,
+  readFrontmatterNoteId,
+} from "../domain/identity";
 import type { StorageService } from "../domain/StorageService";
+import { NOTE_ID_FRONTMATTER_KEY } from "../domain/types";
 
 export class VaultWatcher {
+  private readonly identityWrites = new Set<string>();
+  private readonly recentIdentityWrites = new Map<string, number>();
+
   constructor(
-    private plugin: Plugin,
-    private storage: StorageService,
-    private fsrs: FSRSService,
-    private onListMayChange: () => void,
+    private readonly plugin: Plugin,
+    private readonly storage: StorageService,
+    private readonly review: ReviewService,
+    private readonly onListMayChange: () => void,
   ) {}
 
   register(): void {
@@ -29,7 +34,7 @@ export class VaultWatcher {
     this.plugin.registerEvent(
       vault.on("create", (file) => {
         if (file instanceof TFile && file.extension === "md") {
-          this.onCreate(file);
+          void this.runSafely(() => this.reconcileFile(file));
         }
       }),
     );
@@ -37,7 +42,7 @@ export class VaultWatcher {
     this.plugin.registerEvent(
       vault.on("rename", (file, oldPath) => {
         if (file instanceof TFile && file.extension === "md") {
-          this.onRename(file, oldPath);
+          void this.runSafely(() => this.reconcileFile(file, oldPath));
         }
       }),
     );
@@ -45,100 +50,167 @@ export class VaultWatcher {
     this.plugin.registerEvent(
       vault.on("delete", (file) => {
         if (file instanceof TFile && file.extension === "md") {
-          this.onDelete(file);
+          this.storage.onDelete(file.path);
+          this.onListMayChange();
         }
       }),
     );
 
-    // modify 事件：MVP 阶段只更新字符数，用于"短笔记过滤"
-    // M1 阶段会在这里加入 EditTracker 的阈值触发
     this.plugin.registerEvent(
       vault.on("modify", (file) => {
-        if (file instanceof TFile && file.extension === "md") {
-          void this.updateCharacterCount(file);
+        if (!(file instanceof TFile) || file.extension !== "md") return;
+        if (this.identityWrites.has(file.path)) return;
+
+        // processFrontMatter can emit modify just after its promise resolves.
+        // Ignore that one self-generated event, while allowing later user
+        // edits to update characterCount and retry failed identity writes.
+        const writtenAt = this.recentIdentityWrites.get(file.path);
+        if (writtenAt !== undefined) {
+          this.recentIdentityWrites.delete(file.path);
+          if (Date.now() - writtenAt < 1000) return;
         }
+
+        void this.runSafely(() => this.reconcileFile(file));
       }),
     );
   }
 
   /**
-   * 扫描整个 vault，为所有尚未入池的 markdown 文件初始化状态。
-   * 在插件首次启用时调用。
-   * 同时更新已有笔记的 characterCount（如果还没算过）。
+   * Import the whole vault on first enable and repair identities after an
+   * external editor (including Codex) rewrites frontmatter.
    */
   async backfillExistingNotes(): Promise<void> {
-    const vault = this.plugin.app.vault;
-    const files = vault.getMarkdownFiles();
-    const now = new Date();
+    const files = this.plugin.app.vault.getMarkdownFiles();
     let added = 0;
     let updated = 0;
+    let assignedIds = 0;
+
     for (const file of files) {
-      const existing = this.storage.data.notes[file.path];
-      if (!existing) {
-        const newNote = this.fsrs.createInitialNoteState(now);
-        // 首次入池时也算一下字符数
-        try {
-          const content = await vault.cachedRead(file);
-          newNote.characterCount = content.length;
-        } catch {
-          newNote.characterCount = 0;
-        }
-        this.storage.upsertNote(file.path, newNote);
-        added++;
-      } else if (existing.characterCount < 0) {
-        // 已入池但还没算过字符数（老版本数据迁移）
-        try {
-          const content = await vault.cachedRead(file);
-          existing.characterCount = content.length;
-          updated++;
-        } catch {
-          existing.characterCount = 0;
-        }
-      }
+      const result = await this.reconcileFile(file);
+      if (result.added) added++;
+      if (result.updated) updated++;
+      if (result.assignedId) assignedIds++;
     }
-    if (added > 0 || updated > 0) {
+
+    if (added > 0 || updated > 0 || assignedIds > 0) {
       await this.storage.save();
       console.log(
-        `[Resurface] backfilled ${added} new notes, updated ${updated} character counts`,
+        `[Resurface] backfilled ${added} notes, updated ${updated} notes, assigned ${assignedIds} IDs`,
       );
     }
   }
 
-  private async onCreate(file: TFile): Promise<void> {
-    // 如果已存在（重启后扫描到同路径），跳过
-    if (this.storage.data.notes[file.path]) return;
-    const note = this.fsrs.createInitialNoteState(new Date());
-    try {
-      const content = await this.plugin.app.vault.cachedRead(file);
-      note.characterCount = content.length;
-    } catch {
-      note.characterCount = 0;
+  private async reconcileFile(
+    file: TFile,
+    legacyPath?: string,
+  ): Promise<{ added: boolean; updated: boolean; assignedId: boolean }> {
+    const content = await this.plugin.app.vault.cachedRead(file);
+    const frontmatterId = readFrontmatterNoteId(content);
+    let id = frontmatterId ?? createNoteId();
+    let reconciliation = this.storage.reconcileIdentity(id, file.path, legacyPath);
+    let identityWriteFailed = false;
+    let identityWriteAttempted = false;
+
+    const tryWriteIdentity = async (candidateId: string): Promise<boolean> => {
+      identityWriteAttempted = true;
+      if (!isValidNoteId(candidateId)) {
+        identityWriteFailed = true;
+        console.error("[Resurface] refused to write an invalid note ID");
+        return false;
+      }
+      try {
+        await this.writeFrontmatterId(file, candidateId);
+        return true;
+      } catch (error) {
+        identityWriteFailed = true;
+        console.error("[Resurface] failed to write note ID", error);
+        return false;
+      }
+    };
+
+    // A copied Markdown file can carry the original ID. Never merge two
+    // active notes; assign the copied file a fresh identity instead.
+    if (reconciliation.conflict) {
+      id = createNoteId();
+      if (!(await tryWriteIdentity(id))) {
+        // Keep the state addressable while the file manager is unavailable.
+        // A later modify/create pass will replace this temporary key with a
+        // UUID and rebind the state and revlog entries.
+        id = legacyNoteId(file.path);
+      }
+      reconciliation = this.storage.reconcileIdentity(id, file.path, legacyPath);
     }
-    this.storage.upsertNote(file.path, note);
-    this.storage.scheduleSave();
-    this.onListMayChange();
-  }
 
-  private onRename(file: TFile, oldPath: string): void {
-    this.storage.onRename(oldPath, file.path);
-    this.onListMayChange();
-  }
+    // Missing/invalid frontmatter gets a new UUID. If writing it fails, use a
+    // deterministic path-backed key until a later vault event can retry.
+    if (!frontmatterId && !identityWriteAttempted) {
+      if (!(await tryWriteIdentity(id))) {
+        const fallbackId = legacyNoteId(file.path);
+        if (id !== fallbackId) {
+          id = fallbackId;
+          reconciliation = this.storage.reconcileIdentity(
+            id,
+            file.path,
+            legacyPath,
+          );
+        }
+      }
+    }
 
-  private onDelete(file: TFile): void {
-    this.storage.onDelete(file.path);
-    this.onListMayChange();
-  }
-
-  /** 更新字符数（将来由 modify 事件或手动调用） */
-  async updateCharacterCount(file: TFile): Promise<void> {
-    const note = this.storage.data.notes[file.path];
-    if (!note) return;
-    try {
-      const content = await this.plugin.app.vault.cachedRead(file);
+    let added = false;
+    let updated = false;
+    if (!reconciliation.note) {
+      const note = this.review.createIncubatingState(id, file.path);
       note.characterCount = content.length;
+      this.storage.upsertNote(note);
+      added = true;
+    } else {
+      const note = reconciliation.note;
+      if (note.path !== file.path || note.characterCount !== content.length) {
+        note.path = file.path;
+        note.characterCount = content.length;
+        this.storage.upsertNote(note);
+        updated = true;
+      }
+    }
+
+    const assignedId = frontmatterId !== id;
+
+    if (added || updated || assignedId || identityWriteFailed) {
       this.storage.scheduleSave();
-    } catch {
-      // 读失败保持原值
+      this.onListMayChange();
+    }
+    return { added, updated, assignedId };
+  }
+
+  private async writeFrontmatterId(file: TFile, id: string): Promise<void> {
+    if (this.identityWrites.has(file.path)) return;
+    this.identityWrites.add(file.path);
+    let succeeded = false;
+    try {
+      await this.plugin.app.fileManager.processFrontMatter(file, (frontmatter) => {
+        frontmatter[NOTE_ID_FRONTMATTER_KEY] = id;
+      });
+      succeeded = true;
+    } finally {
+      this.identityWrites.delete(file.path);
+      if (succeeded) {
+        const writtenAt = Date.now();
+        this.recentIdentityWrites.set(file.path, writtenAt);
+        setTimeout(() => {
+          if (this.recentIdentityWrites.get(file.path) === writtenAt) {
+            this.recentIdentityWrites.delete(file.path);
+          }
+        }, 1000);
+      }
+    }
+  }
+
+  private async runSafely(task: () => Promise<unknown>): Promise<void> {
+    try {
+      await task();
+    } catch (error) {
+      console.error("[Resurface] failed to reconcile note identity", error);
     }
   }
 }

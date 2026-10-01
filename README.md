@@ -2,9 +2,12 @@
 
 **🌐 Language**: **English** · [中文](./README.zh-CN.md)
 
-> Spaced repetition for Obsidian, where your notes are the review unit.
+> Spaced rediscovery for Obsidian, where your notes are the review unit.
 
-An Obsidian plugin for reviewing what you've written, powered by [FSRS-6](https://github.com/open-spaced-repetition/fsrs4anki/wiki). Notes enter the review pool automatically — no flashcards, no pre-processing. The scheduler brings them back at the right moment, and you can edit them while reviewing.
+An Obsidian plugin for reviewing what you've written. Notes enter a
+rediscovery queue automatically — no flashcards, no pre-processing. You decide
+at review time whether a note should disappear, return occasionally, or enter
+real FSRS learning.
 
 ## Why another SRS plugin?
 
@@ -21,10 +24,13 @@ Resurface takes the opposite path:
 
 ## Core features
 
-- **FSRS-6 scheduling** — the open-source SOTA algorithm ([~30% lower Log Loss than SM-2](https://github.com/open-spaced-repetition/srs-benchmark))
-- **Auto-enroll** — new markdown notes join the pool, first review in 3 ± 1 days
-- **Urgency ordering** — notes sorted by current retrievability (R); the ones you're about to forget come first
-- **Daily cap** — default 15 notes/day; overflow is absorbed by FSRS naturally
+- **Two-stage review** — rediscovery first, FSRS-6 only after you choose Learn
+- **Triage at review time** — Never, Later, Soon, or Learn
+- **Configurable rediscovery ladder** — Soon by default in 3 days; Later defaults to 30 → 90 → 180 → 365 days
+- **Stable note identity** — `resurface-id` frontmatter survives Codex/Obsidian moves and rewrites
+- **No daily cap** — every due note is available, ordered by oldest due time
+- **Fast-forward command** — "快进一天" pulls future reviews one day closer without touching already-due notes
+- **Auto-enroll** — existing and new markdown notes join the pool, first appearance in 3 ± 1 days
 - **Allowed paths** — whitelist specific folders (recursive, multi-select)
 - **Short-note filter** — notes under 50 characters (configurable) don't enter the pool
 - **Quiet UI** — no push notifications; only a subtle ribbon badge and a single notice on startup
@@ -57,9 +63,13 @@ The build output is auto-deployed to the vault configured in `.env.local` via `V
 2. **When you open Obsidian** — a brief notice appears: `🌱 N notes want to see you again today`. The ribbon 🌱 icon shows the count.
 3. **Click the ribbon** — the right sidebar opens with the first note's title + TLDR
 4. **Click "Expand"** — the main pane opens the note (reuses a single "review tab", not a new one each time)
-5. **Rate "Known" / "Forgot"** — FSRS schedules the next review; the note stays open so you can edit/link/reflect
-6. **Click "Next"** — proceed to the next note. Repeat until today's queue is done.
-7. **"Never again"** — a click permanently removes a note from the pool
+5. **Choose a triage action** — Never, Later, Soon, or Learn. The first three do not invoke FSRS.
+6. **After Learn, rate the note** — Again / Hard / Good / Easy are handled by FSRS.
+7. **Click "Next"** — proceed to the next due note. The note stays open so you can edit it.
+
+The first vault scan adds a `resurface-id` UUID to Markdown files that do not
+already have one. Scheduling metadata remains in `data.json`; review actions
+do not rewrite the note body.
 
 ## TLDR extraction
 
@@ -75,13 +85,14 @@ No need to change your writing habits — the better you author TLDRs, the bette
 
 ## Settings
 
-**Basic**: daily limit · first review delay · rating buttons (2 or 4) · auto-advance · allowed paths
+**Basic**: first appearance delay · Soon interval · rating buttons (2 or 4) · auto-advance · allowed paths
 
-**Advanced**: desired retention · first-review jitter · TLDR field name · min characters · streak toggle · edit thresholds · post-edit action (M1)
+**Advanced**: desired retention · first-review jitter · Later interval ladder · TLDR field name · min characters · streak toggle
 
 ## Design philosophy
 
 - **Notes = review units** — no separate card system
+- **Capture first, decide later** — rediscovery is a value decision; FSRS is a memory decision
 - **Quiet by default** — no pushes, just passive visual hints
 - **Decide at review time** — no need to pre-tag or pre-configure
 - **Notes are alive** — reviewing them can grow them
@@ -95,7 +106,7 @@ No need to change your writing habits — the better you author TLDRs, the bette
 
 ## Roadmap
 
-- [x] **v0.1.0 MVP** — scheduling + review UI + allowed paths + short-note filter
+- [x] **v0.1.0 MVP** — rediscovery triage + FSRS learning + stable note identity
 - [ ] **M1** — edits affect scheduling (large edit → Stability × 0.5) · JOL calibration feedback
 - [ ] **M2** — excluded-notes management UI · note stabilization period
 - [ ] **M3** — local FSRS parameter re-optimization · data dashboard
@@ -105,7 +116,7 @@ No need to change your writing habits — the better you author TLDRs, the bette
 
 - **TypeScript** · **Obsidian Plugin API** · **Native DOM** (no React/Vue)
 - [**ts-fsrs**](https://github.com/open-spaced-repetition/ts-fsrs) 4.7.1 · MIT
-- **esbuild** build · **Vitest** for pure-function tests (48 tests)
+- **esbuild** build · **Vitest** for pure-function tests (60 tests)
 
 ## Acknowledgments
 

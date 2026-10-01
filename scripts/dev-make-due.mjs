@@ -5,7 +5,7 @@
  * 用法：node scripts/dev-make-due.mjs [count=5]
  *
  * 会自动：
- *   - 避开已排除的笔记
+ *   - 避开 suspended 笔记
  *   - 避开已经到期的笔记（避免重复）
  *   - 如果设置了 allowedPaths，只挑白名单下的笔记
  */
@@ -44,28 +44,28 @@ const isAllowed = (p) => {
 };
 
 const candidates = Object.entries(data.notes)
-  .filter(([p, n]) => {
-    if (n.excluded) return false;
+  .filter(([, n]) => {
+    if (n.mode === "suspended") return false;
     if (new Date(n.nextReview) <= now) return false; // 已经到期的跳过
-    if (!isAllowed(p)) return false;
+    if (!isAllowed(n.path)) return false;
     return true;
   })
-  .map(([p]) => p)
+  .map(([id, note]) => ({ id, path: note.path }))
   .slice(0, count);
 
 if (candidates.length === 0) {
-  console.log("找不到符合条件的笔记（已排除/已到期/不在白名单内）");
+  console.log("找不到符合条件的笔记（suspended/已到期/不在白名单内）");
   process.exit(0);
 }
 
-for (const path of candidates) {
-  data.notes[path].nextReview = yesterdayIso;
+for (const { id } of candidates) {
+  data.notes[id].nextReview = yesterdayIso;
 }
 
 await writeFile(DATA_FILE, JSON.stringify(data, null, 2));
 
 console.log(`\n已把 ${candidates.length} 条笔记的 nextReview 改到昨天，立即到期：\n`);
-for (const p of candidates) console.log("  -", p);
+for (const { path } of candidates) console.log("  -", path);
 console.log(
   "\n⚠️ Cmd+P → 'Reload app without saving' 让插件重读 data.json",
 );
